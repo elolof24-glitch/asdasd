@@ -82,6 +82,10 @@ function normalizeAddress(address) {
   return value.startsWith("0x") ? value.toLowerCase() : value;
 }
 
+function isValidEvmAddress(address) {
+  return /^0x[a-fA-F0-9]{40}$/.test(String(address || ""));
+}
+
 function isValidBackfillRequest(url) {
   return url.searchParams.get("token") === backfillToken;
 }
@@ -215,7 +219,6 @@ async function setState(key, value) {
 
 async function fetchUsersFromNeynar(fids) {
   const url = new URL("https://api.neynar.com/v2/farcaster/user/bulk/");
-
   url.searchParams.set("fids", fids.join(","));
 
   const response = await fetch(url, {
@@ -232,7 +235,6 @@ async function fetchUsersFromNeynar(fids) {
   }
 
   const body = JSON.parse(text);
-
   return Array.isArray(body.users) ? body.users : [];
 }
 
@@ -367,7 +369,6 @@ async function importFidBatch(startFid, batchSize) {
   );
 
   const users = await fetchUsersFromNeynar(fids);
-
   await saveUsers(users);
 
   return {
@@ -430,7 +431,6 @@ async function runBackfill(endFid, batchSize, delayMs) {
           error instanceof Error ? error.message : String(error);
 
         console.error(`[backfill] error at FID ${nextFid}: ${message}`);
-
         await setState("backfill_last_error", message);
         await setState("backfill_status", "paused_after_error");
 
@@ -521,6 +521,37 @@ async function getUsers(search, pageNumber) {
     users,
     hasNextPage,
   };
+}
+
+async function getWalletOwner(address) {
+  const normalizedAddress = normalizeAddress(address);
+
+  if (!isValidEvmAddress(normalizedAddress)) {
+    return null;
+  }
+
+  const result = await pool.query(
+    `
+      SELECT
+        w.address,
+        w.chain,
+        w.wallet_type,
+        w.source,
+        w.updated_at AS wallet_updated_at,
+        u.fid,
+        u.username,
+        u.display_name,
+        u.pfp_url,
+        u.updated_at AS profile_updated_at
+      FROM wallets w
+      INNER JOIN farcaster_users u ON u.fid = w.fid
+      WHERE LOWER(w.address) = LOWER($1)
+      LIMIT 1
+    `,
+    [normalizedAddress]
+  );
+
+  return result.rows[0] || null;
 }
 
 async function getDirectoryTotals() {
@@ -686,477 +717,96 @@ function page(users, totals, search, pageNumber, hasNextPage) {
   <title>Farcaster Wallet Tracker</title>
 
   <style>
-    * {
-      box-sizing: border-box;
-    }
-
-    body {
-      margin: 0;
-      background: #090b10;
-      color: #f4f4f5;
-      font-family: Arial, sans-serif;
-    }
-
-    .wrap {
-      max-width: 1220px;
-      margin: auto;
-      padding: 30px 16px 60px;
-    }
-
-    .eyebrow {
-      color: #22d3ee;
-      font-size: 11px;
-      font-weight: 800;
-      letter-spacing: 2px;
-    }
-
-    h1 {
-      margin: 8px 0;
-      font-size: 30px;
-    }
-
-    .description {
-      color: #a1a1aa;
-      margin: 0 0 22px;
-    }
-
-    form {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 20px;
-    }
-
-    input {
-      flex: 1;
-      min-width: 0;
-      padding: 13px;
-      border: 1px solid #3f3f46;
-      border-radius: 8px;
-      background: #18181b;
-      color: #fff;
-      font-size: 15px;
-    }
-
-    form button {
-      border: 0;
-      border-radius: 8px;
-      background: #22d3ee;
-      color: #071014;
-      padding: 0 16px;
-      font-weight: 800;
-      cursor: pointer;
-    }
-
-    .meta {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      color: #a1a1aa;
-      font-size: 13px;
-      margin: 12px 0;
-    }
-
-    .meta b {
-      color: #fff;
-    }
-
-    .directory {
-      border: 1px solid #27272a;
-      border-radius: 12px;
-      overflow: hidden;
-      background: #10131a;
-    }
-
-    .user-card {
-      border-bottom: 1px solid #27272a;
-    }
-
-    .user-card:last-child {
-      border: 0;
-    }
-
-    .user-row {
-      width: 100%;
-      border: 0;
-      background: transparent;
-      color: inherit;
-      text-align: left;
-      cursor: pointer;
-      display: grid;
-      grid-template-columns: 60px minmax(220px, 2fr) 120px 200px 100px;
-      gap: 12px;
-      align-items: center;
-      padding: 15px;
-    }
-
-    .user-row:hover {
-      background: #171b24;
-    }
-
-    .rank {
-      color: #71717a;
-    }
-
-    .profile {
-      min-width: 0;
-    }
-
-    .profile-link {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      min-width: 0;
-      color: inherit;
-      text-decoration: none;
-    }
-
-    .profile-text {
-      min-width: 0;
-    }
-
-    a.profile-link:hover strong,
-    a.profile-link:hover .handle {
-      color: #67e8f9;
-      text-decoration: underline;
-    }
-
-    .avatar {
-      width: 40px;
-      height: 40px;
-      flex: none;
-      border-radius: 50%;
-      overflow: hidden;
-      background: #27272a;
-      display: grid;
-      place-items: center;
-    }
-
-    .avatar img {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-    }
-
-    strong,
-    .handle {
-      display: block;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    strong {
-      font-size: 15px;
-    }
-
-    .handle {
-      font-size: 13px;
-      color: #22d3ee;
-      margin-top: 3px;
-    }
-
-    .fid,
-    .follower-link,
-    .wallet-count {
-      font-size: 14px;
-    }
-
-    .follower-link a {
-      color: #22d3ee;
-      text-decoration: none;
-      font-size: 12px;
-    }
-
-    .follower-link a:hover {
-      color: #67e8f9;
-      text-decoration: underline;
-    }
-
-    .follower-link span {
-      color: #71717a;
-      font-size: 12px;
-    }
-
-    .wallet-count {
-      font-weight: 700;
-    }
-
-    .wallet-count small {
-      display: block;
-      color: #71717a;
-      font-size: 11px;
-      font-weight: 400;
-      margin-top: 3px;
-    }
-
-    .wallet-panel {
-      display: none;
-      border-top: 1px solid #27272a;
-      background: #0b0e14;
-      padding: 15px;
-    }
-
-    .wallet-panel.open {
-      display: block;
-    }
-
-    .wallet-panel-title {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      color: #a1a1aa;
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      margin-bottom: 10px;
-    }
-
-    .wallet-panel-title small {
-      display: block;
-      margin-top: 5px;
-      color: #71717a;
-      font-size: 11px;
-      text-transform: none;
-      letter-spacing: 0;
-    }
-
-    .wallet-panel-title a {
-      color: #22d3ee;
-      text-decoration: none;
-      text-transform: none;
-      letter-spacing: 0;
-      white-space: nowrap;
-    }
-
-    .wallet-panel-title a:hover {
-      color: #67e8f9;
-      text-decoration: underline;
-    }
-
-    .wallet {
-      display: flex;
-      justify-content: space-between;
-      gap: 15px;
-      align-items: center;
-      border: 1px solid #27272a;
-      border-radius: 8px;
-      background: #090b10;
-      padding: 11px 12px;
-      margin-top: 8px;
-    }
-
-    .wallet-main {
-      min-width: 0;
-    }
-
-    .wallet code {
-      color: #e4e4e7;
-      font-size: 13px;
-    }
-
-    .wallet-details {
-      display: flex;
-      gap: 7px;
-      align-items: center;
-      flex-wrap: wrap;
-      margin-top: 7px;
-    }
-
-    .wallet-badge,
-    .wallet-chain {
-      border-radius: 999px;
-      padding: 3px 7px;
-      font-size: 10px;
-      font-weight: 700;
-    }
-
-    .wallet-badge.custody {
-      background: #27354f;
-      color: #93c5fd;
-    }
-
-    .wallet-badge.evm {
-      background: #16362d;
-      color: #86efac;
-    }
-
-    .wallet-badge.solana {
-      background: #34234b;
-      color: #d8b4fe;
-    }
-
-    .wallet-badge.unknown {
-      background: #3f3f46;
-      color: #d4d4d8;
-    }
-
-    .wallet-chain {
-      background: #27272a;
-      color: #a1a1aa;
-      text-transform: uppercase;
-    }
-
-    .wallet small {
-      display: block;
-      color: #71717a;
-      margin-top: 7px;
-      font-size: 11px;
-    }
-
-    .wallet-links {
-      display: flex;
-      gap: 8px;
-      flex: none;
-    }
-
-    .wallet-links button,
-    .wallet-links a {
-      border: 1px solid #3f3f46;
-      background: transparent;
-      color: #d4d4d8;
-      padding: 6px 8px;
-      border-radius: 6px;
-      text-decoration: none;
-      font-size: 12px;
-      cursor: pointer;
-    }
-
-    .wallet-links button:hover,
-    .wallet-links a:hover {
-      border-color: #22d3ee;
-      color: #22d3ee;
-    }
-
-    .pagination {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      margin-top: 18px;
-    }
-
-    .pagination a,
-    .pagination span {
-      border: 1px solid #3f3f46;
-      border-radius: 8px;
-      padding: 10px 13px;
-      color: #d4d4d8;
-      font-size: 13px;
-      text-decoration: none;
-    }
-
-    .pagination a:hover {
-      border-color: #22d3ee;
-      color: #22d3ee;
-    }
-
-    .pagination .disabled {
-      color: #52525b;
-      border-color: #27272a;
-    }
-
-    .pagination .page-status {
-      border: 0;
-      color: #a1a1aa;
-      padding: 0;
-    }
-
-    .empty-wallets {
-      color: #71717a;
-      font-size: 13px;
-    }
-
-    .empty {
-      padding: 50px;
-      text-align: center;
-      color: #a1a1aa;
-    }
-
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #090b10; color: #f4f4f5; font-family: Arial, sans-serif; }
+    .wrap { max-width: 1220px; margin: auto; padding: 30px 16px 60px; }
+    .eyebrow { color: #22d3ee; font-size: 11px; font-weight: 800; letter-spacing: 2px; }
+    h1 { margin: 8px 0; font-size: 30px; }
+    .description { color: #a1a1aa; margin: 0 0 22px; }
+    form { display: flex; gap: 8px; margin-bottom: 20px; }
+    input { flex: 1; min-width: 0; padding: 13px; border: 1px solid #3f3f46; border-radius: 8px; background: #18181b; color: #fff; font-size: 15px; }
+    form button { border: 0; border-radius: 8px; background: #22d3ee; color: #071014; padding: 0 16px; font-weight: 800; cursor: pointer; }
+    .meta { display: flex; justify-content: space-between; gap: 12px; color: #a1a1aa; font-size: 13px; margin: 12px 0; }
+    .meta b { color: #fff; }
+    .directory { border: 1px solid #27272a; border-radius: 12px; overflow: hidden; background: #10131a; }
+    .user-card { border-bottom: 1px solid #27272a; }
+    .user-card:last-child { border: 0; }
+    .user-row { width: 100%; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; display: grid; grid-template-columns: 60px minmax(220px, 2fr) 120px 200px 100px; gap: 12px; align-items: center; padding: 15px; }
+    .user-row:hover { background: #171b24; }
+    .rank { color: #71717a; }
+    .profile { min-width: 0; }
+    .profile-link { display: flex; align-items: center; gap: 12px; min-width: 0; color: inherit; text-decoration: none; }
+    .profile-text { min-width: 0; }
+    a.profile-link:hover strong, a.profile-link:hover .handle { color: #67e8f9; text-decoration: underline; }
+    .avatar { width: 40px; height: 40px; flex: none; border-radius: 50%; overflow: hidden; background: #27272a; display: grid; place-items: center; }
+    .avatar img { width: 100%; height: 100%; object-fit: cover; }
+    strong, .handle { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    strong { font-size: 15px; }
+    .handle { font-size: 13px; color: #22d3ee; margin-top: 3px; }
+    .fid, .follower-link, .wallet-count { font-size: 14px; }
+    .follower-link a { color: #22d3ee; text-decoration: none; font-size: 12px; }
+    .follower-link a:hover { color: #67e8f9; text-decoration: underline; }
+    .follower-link span { color: #71717a; font-size: 12px; }
+    .wallet-count { font-weight: 700; }
+    .wallet-count small { display: block; color: #71717a; font-size: 11px; font-weight: 400; margin-top: 3px; }
+    .wallet-panel { display: none; border-top: 1px solid #27272a; background: #0b0e14; padding: 15px; }
+    .wallet-panel.open { display: block; }
+    .wallet-panel-title { display: flex; justify-content: space-between; gap: 12px; color: #a1a1aa; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+    .wallet-panel-title small { display: block; margin-top: 5px; color: #71717a; font-size: 11px; text-transform: none; letter-spacing: 0; }
+    .wallet-panel-title a { color: #22d3ee; text-decoration: none; text-transform: none; letter-spacing: 0; white-space: nowrap; }
+    .wallet-panel-title a:hover { color: #67e8f9; text-decoration: underline; }
+    .wallet { display: flex; justify-content: space-between; gap: 15px; align-items: center; border: 1px solid #27272a; border-radius: 8px; background: #090b10; padding: 11px 12px; margin-top: 8px; }
+    .wallet-main { min-width: 0; }
+    .wallet code { color: #e4e4e7; font-size: 13px; }
+    .wallet-details { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; margin-top: 7px; }
+    .wallet-badge, .wallet-chain { border-radius: 999px; padding: 3px 7px; font-size: 10px; font-weight: 700; }
+    .wallet-badge.custody { background: #27354f; color: #93c5fd; }
+    .wallet-badge.evm { background: #16362d; color: #86efac; }
+    .wallet-badge.solana { background: #34234b; color: #d8b4fe; }
+    .wallet-badge.unknown { background: #3f3f46; color: #d4d4d8; }
+    .wallet-chain { background: #27272a; color: #a1a1aa; text-transform: uppercase; }
+    .wallet small { display: block; color: #71717a; margin-top: 7px; font-size: 11px; }
+    .wallet-links { display: flex; gap: 8px; flex: none; }
+    .wallet-links button, .wallet-links a { border: 1px solid #3f3f46; background: transparent; color: #d4d4d8; padding: 6px 8px; border-radius: 6px; text-decoration: none; font-size: 12px; cursor: pointer; }
+    .wallet-links button:hover, .wallet-links a:hover { border-color: #22d3ee; color: #22d3ee; }
+    .pagination { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 18px; }
+    .pagination a, .pagination span { border: 1px solid #3f3f46; border-radius: 8px; padding: 10px 13px; color: #d4d4d8; font-size: 13px; text-decoration: none; }
+    .pagination a:hover { border-color: #22d3ee; color: #22d3ee; }
+    .pagination .disabled { color: #52525b; border-color: #27272a; }
+    .pagination .page-status { border: 0; color: #a1a1aa; padding: 0; }
+    .empty-wallets { color: #71717a; font-size: 13px; }
+    .empty { padding: 50px; text-align: center; color: #a1a1aa; }
     @media (max-width: 700px) {
-      .user-row {
-        grid-template-columns: 40px 1fr 72px;
-        gap: 8px;
-        padding: 13px;
-      }
-
-      .fid,
-      .follower-link,
-      .wallet-count {
-        display: none;
-      }
-
-      .wallet {
-        align-items: flex-start;
-        flex-direction: column;
-      }
-
-      .wallet-links {
-        width: 100%;
-      }
-
-      .wallet-links > * {
-        flex: 1;
-        text-align: center;
-      }
-
-      .meta {
-        flex-direction: column;
-        gap: 4px;
-      }
-
-      .wallet-panel-title {
-        align-items: flex-start;
-        flex-direction: column;
-      }
-
-      .pagination {
-        flex-wrap: wrap;
-      }
-
-      .pagination .page-status {
-        order: 3;
-        width: 100%;
-        text-align: center;
-      }
+      .user-row { grid-template-columns: 40px 1fr 72px; gap: 8px; padding: 13px; }
+      .fid, .follower-link, .wallet-count { display: none; }
+      .wallet { align-items: flex-start; flex-direction: column; }
+      .wallet-links { width: 100%; }
+      .wallet-links > * { flex: 1; text-align: center; }
+      .meta { flex-direction: column; gap: 4px; }
+      .wallet-panel-title { align-items: flex-start; flex-direction: column; }
+      .pagination { flex-wrap: wrap; }
+      .pagination .page-status { order: 3; width: 100%; text-align: center; }
     }
   </style>
 </head>
-
 <body>
   <main class="wrap">
     <div class="eyebrow">FARCASTER INTELLIGENCE</div>
-
     <h1>Connected Wallet Directory</h1>
-
-    <p class="description">
-      Browse Farcaster custody and verified wallet addresses.
-      Open a Farcaster profile to view its current follower count.
-    </p>
+    <p class="description">Browse Farcaster custody and verified wallet addresses. Open a Farcaster profile to view its current follower count.</p>
 
     <form>
-      <input
-        name="search"
-        value="${escapeAttribute(search)}"
-        placeholder="Search @username, FID, or wallet address"
-      >
+      <input name="search" value="${escapeAttribute(search)}" placeholder="Search @username, FID, or wallet address">
       <button type="submit">Search</button>
     </form>
 
     <div class="meta">
-      <span>
-        <b>${formatNumber(totals.user_count)}</b> imported Farcaster users ·
-        <b>${formatNumber(totals.wallet_count)}</b> Farcaster-linked wallets
-      </span>
-
+      <span><b>${formatNumber(totals.user_count)}</b> imported Farcaster users · <b>${formatNumber(totals.wallet_count)}</b> Farcaster-linked wallets</span>
       <span>Sort: FID ↑</span>
     </div>
 
     <section class="directory">
-      ${
-        users.length
-          ? rows
-          : `<div class="empty">No users match your search yet.</div>`
-      }
+      ${users.length ? rows : `<div class="empty">No users match your search yet.</div>`}
     </section>
 
     <nav class="pagination" aria-label="Directory pages">
@@ -1165,11 +815,7 @@ function page(users, totals, search, pageNumber, hasNextPage) {
           ? `<a href="${escapeAttribute(previousUrl)}">← Previous</a>`
           : `<span class="disabled">← Previous</span>`
       }
-
-      <span class="page-status">
-        Page ${formatNumber(pageNumber)} · ${PAGE_SIZE} users per page
-      </span>
-
+      <span class="page-status">Page ${formatNumber(pageNumber)} · ${PAGE_SIZE} users per page</span>
       ${
         hasNextPage
           ? `<a href="${escapeAttribute(nextUrl)}">Next →</a>`
@@ -1208,6 +854,26 @@ async function start() {
           ok: true,
           backfillRunning,
           timestamp: new Date().toISOString(),
+        });
+      }
+
+      if (url.pathname === "/api/wallet") {
+        const address = url.searchParams.get("address") || "";
+
+        if (!isValidEvmAddress(address)) {
+          return json(res, 400, {
+            ok: false,
+            found: false,
+            error: "Invalid EVM wallet address.",
+          });
+        }
+
+        const wallet = await getWalletOwner(address);
+
+        return json(res, 200, {
+          ok: true,
+          found: Boolean(wallet),
+          wallet: wallet || null,
         });
       }
 
@@ -1314,7 +980,6 @@ async function start() {
         }
 
         const users = await fetchUsersFromNeynar(validFids);
-
         await saveUsers(users);
 
         return json(res, 200, {
@@ -1352,14 +1017,12 @@ async function start() {
             directory.hasNextPage
           )
         );
-
         return;
       }
 
       res.writeHead(404, {
         "Content-Type": "text/plain; charset=utf-8",
       });
-
       res.end("Not found");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
