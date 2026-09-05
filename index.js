@@ -24,6 +24,8 @@ const pool = new Pool({
   max: 5,
 });
 
+const PAGE_SIZE = 100;
+
 let backfillRunning = false;
 let stopRequested = false;
 
@@ -100,7 +102,7 @@ function walletTypeLabel(walletType) {
     verified_solana: "Verified Solana wallet",
   };
 
-  return labels[walletType] || String(walletType || "Unknown wallet");
+  return labels[walletType] || "Farcaster-linked wallet";
 }
 
 function walletTypeClass(walletType) {
@@ -111,6 +113,22 @@ function walletTypeClass(walletType) {
   };
 
   return classes[walletType] || "unknown";
+}
+
+function buildDirectoryUrl(search, pageNumber) {
+  const params = new URLSearchParams();
+
+  if (search) {
+    params.set("search", search);
+  }
+
+  if (pageNumber > 1) {
+    params.set("page", String(pageNumber));
+  }
+
+  const query = params.toString();
+
+  return query ? `/?${query}` : "/";
 }
 
 async function ensureSchema() {
@@ -200,11 +218,13 @@ async function setState(key, value) {
 
 async function fetchUsersFromNeynar(fids) {
   const url = new URL("https://api.neynar.com/v2/farcaster/user/bulk/");
+
   url.searchParams.set("fids", fids.join(","));
 
   const response = await fetch(url, {
     headers: {
       "x-api-key": neynarApiKey,
+      "x-neynar-experimental": "true",
       accept: "application/json",
     },
   });
@@ -428,7 +448,8 @@ async function runBackfill(endFid, batchSize, delayMs) {
   }
 }
 
-async function getUsers(search) {
+async function getUsers(search, pageNumber) {
+  const offset = (pageNumber - 1) * PAGE_SIZE;
   const values = [];
   let where = "";
 
@@ -449,6 +470,9 @@ async function getUsers(search) {
         )
     `;
   }
+
+  values.push(PAGE_SIZE + 1);
+  values.push(offset);
 
   const result = await pool.query(
     `
@@ -478,12 +502,19 @@ async function getUsers(search) {
       ${where}
       GROUP BY u.fid
       ORDER BY u.follower_count DESC NULLS LAST, u.fid ASC
-      LIMIT 250
+      LIMIT $${values.length - 1}
+      OFFSET $${values.length}
     `,
     values
   );
 
-  return result.rows;
+  const hasNextPage = result.rows.length > PAGE_SIZE;
+  const users = hasNextPage ? result.rows.slice(0, PAGE_SIZE) : result.rows;
+
+  return {
+    users,
+    hasNextPage,
+  };
 }
 
 async function getDirectoryTotals() {
@@ -496,19 +527,22 @@ async function getDirectoryTotals() {
   return result.rows[0];
 }
 
-function page(users, totals, search) {
+function page(users, totals, search, pageNumber, hasNextPage) {
+  const startRank = (pageNumber - 1) * PAGE_SIZE;
+
   const rows = users
     .map((user, index) => {
       const profileName = user.display_name || user.username || "Unknown";
+
       const profileUrl = user.username
         ? `https://warpcast.com/${encodeURIComponent(user.username)}`
-        : null;
+        : "";
 
       const avatar = user.pfp_url
         ? `<img src="${escapeAttribute(user.pfp_url)}" alt="">`
         : `<span>${escapeHtml(profileName.slice(0, 1).toUpperCase())}</span>`;
 
-      const profileHtml = profileUrl
+      const profile = profileUrl
         ? `
           <a
             class="profile-link"
@@ -518,7 +552,7 @@ function page(users, totals, search) {
             onclick="event.stopPropagation()"
           >
             <span class="avatar">${avatar}</span>
-            <span>
+            <span class="profile-text">
               <strong>${escapeHtml(profileName)}</strong>
               <span class="handle">@${escapeHtml(user.username)}</span>
             </span>
@@ -527,7 +561,7 @@ function page(users, totals, search) {
         : `
           <span class="profile-link">
             <span class="avatar">${avatar}</span>
-            <span>
+            <span class="profile-text">
               <strong>${escapeHtml(profileName)}</strong>
               <span class="handle">@unknown</span>
             </span>
@@ -536,57 +570,53 @@ function page(users, totals, search) {
 
       const wallets = user.wallets.length
         ? user.wallets
-            .map((wallet) => {
-              const arkmUrl = `https://intel.arkm.com/explorer/address/${encodeURIComponent(
-                wallet.address
-              )}`;
+            .map((wallet) => `
+              <div class="wallet">
+                <div class="wallet-main">
+                  <code title="${escapeAttribute(wallet.address)}">${escapeHtml(
+                    shortAddress(wallet.address)
+                  )}</code>
 
-              return `
-                <div class="wallet">
-                  <div class="wallet-main">
-                    <code title="${escapeAttribute(wallet.address)}">${escapeHtml(
-                      shortAddress(wallet.address)
-                    )}</code>
-                    <div class="wallet-details">
-                      <span class="wallet-badge ${walletTypeClass(
-                        wallet.wallet_type
-                      )}">${escapeHtml(
+                  <div class="wallet-details">
+                    <span class="wallet-badge ${walletTypeClass(
+                      wallet.wallet_type
+                    )}">${escapeHtml(
                 walletTypeLabel(wallet.wallet_type)
               )}</span>
-                      <span class="wallet-chain">${escapeHtml(
-                        wallet.chain
-                      )}</span>
-                    </div>
-                    <small>Source: ${escapeHtml(
-                      wallet.source || "neynar"
-                    )} · synced ${escapeHtml(formatDate(wallet.updated_at))}</small>
+
+                    <span class="wallet-chain">${escapeHtml(wallet.chain)}</span>
                   </div>
 
-                  <div class="wallet-links">
-                    <button
-                      type="button"
-                      onclick="copyWallet('${escapeAttribute(wallet.address)}')"
-                    >
-                      Copy
-                    </button>
-
-                    <a
-                      href="${arkmUrl}"
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      Arkham ↗
-                    </a>
-                  </div>
+                  <small>
+                    Source: ${escapeHtml(wallet.source || "neynar")} ·
+                    synced ${escapeHtml(formatDate(wallet.updated_at))}
+                  </small>
                 </div>
-              `;
-            })
+
+                <div class="wallet-links">
+                  <button
+                    type="button"
+                    onclick="event.stopPropagation(); copyWallet('${escapeAttribute(
+                      wallet.address
+                    )}')"
+                  >
+                    Copy
+                  </button>
+
+                  <a
+                    href="https://intel.arkm.com/explorer/address/${encodeURIComponent(
+                      wallet.address
+                    )}"
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Arkham ↗
+                  </a>
+                </div>
+              </div>
+            `)
             .join("")
         : `<p class="empty-wallets">No connected wallets were returned for this Farcaster user.</p>`;
-
-      const profileLink = profileUrl
-        ? `<a href="${profileUrl}" target="_blank" rel="noreferrer">Open Farcaster profile ↗</a>`
-        : "";
 
       return `
         <article class="user-card">
@@ -595,17 +625,15 @@ function page(users, totals, search) {
             class="user-row"
             onclick="toggleUser('user-${user.fid}')"
           >
-            <span class="rank">#${index + 1}</span>
+            <span class="rank">#${startRank + index + 1}</span>
 
-            <span class="profile">
-              ${profileHtml}
-            </span>
+            <span class="profile">${profile}</span>
 
             <span class="fid">FID #${user.fid}</span>
 
             <span class="followers">
               ${formatNumber(user.follower_count)}
-              <small>Neynar follower snapshot</small>
+              <small>filtered follower count</small>
             </span>
 
             <span class="wallet-count">
@@ -623,7 +651,11 @@ function page(users, totals, search) {
                 )}</small>
               </div>
 
-              ${profileLink}
+              ${
+                profileUrl
+                  ? `<a href="${profileUrl}" target="_blank" rel="noreferrer">Open Farcaster profile ↗</a>`
+                  : ""
+              }
             </div>
 
             ${wallets}
@@ -632,6 +664,9 @@ function page(users, totals, search) {
       `;
     })
     .join("");
+
+  const previousUrl = buildDirectoryUrl(search, Math.max(1, pageNumber - 1));
+  const nextUrl = buildDirectoryUrl(search, pageNumber + 1);
 
   return `<!doctype html>
 <html>
@@ -705,6 +740,7 @@ function page(users, totals, search) {
     .meta {
       display: flex;
       justify-content: space-between;
+      gap: 12px;
       color: #a1a1aa;
       font-size: 13px;
       margin: 12px 0;
@@ -762,6 +798,10 @@ function page(users, totals, search) {
       min-width: 0;
       color: inherit;
       text-decoration: none;
+    }
+
+    .profile-text {
+      min-width: 0;
     }
 
     a.profile-link:hover strong,
@@ -962,6 +1002,41 @@ function page(users, totals, search) {
       color: #22d3ee;
     }
 
+    .pagination {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    .pagination a,
+    .pagination span {
+      border: 1px solid #3f3f46;
+      border-radius: 8px;
+      padding: 10px 13px;
+      color: #d4d4d8;
+      font-size: 13px;
+      text-decoration: none;
+    }
+
+    .pagination a:hover {
+      border-color: #22d3ee;
+      color: #22d3ee;
+    }
+
+    .pagination .disabled {
+      color: #52525b;
+      border-color: #27272a;
+      cursor: not-allowed;
+    }
+
+    .pagination .page-status {
+      border: 0;
+      color: #a1a1aa;
+      padding: 0;
+    }
+
     .empty-wallets {
       color: #71717a;
       font-size: 13px;
@@ -1004,7 +1079,8 @@ function page(users, totals, search) {
       }
 
       .meta {
-        gap: 10px;
+        flex-direction: column;
+        gap: 4px;
       }
 
       .user-row .followers {
@@ -1027,7 +1103,7 @@ function page(users, totals, search) {
 
     <p class="description">
       Farcaster custody and verified wallet addresses from Neynar.
-      Users are sorted by the stored Neynar follower snapshot.
+      Users are sorted by filtered follower count.
     </p>
 
     <form>
@@ -1045,7 +1121,7 @@ function page(users, totals, search) {
         <b>${formatNumber(totals.wallet_count)}</b> Farcaster-linked wallets
       </span>
 
-      <span>Sort: Neynar followers ↓</span>
+      <span>Sort: filtered followers ↓</span>
     </div>
 
     <section class="directory">
@@ -1055,6 +1131,24 @@ function page(users, totals, search) {
           : `<div class="empty">No users match your search yet.</div>`
       }
     </section>
+
+    <nav class="pagination" aria-label="Directory pages">
+      ${
+        pageNumber > 1
+          ? `<a href="${escapeAttribute(previousUrl)}">← Previous</a>`
+          : `<span class="disabled">← Previous</span>`
+      }
+
+      <span class="page-status">
+        Page ${formatNumber(pageNumber)} · ${PAGE_SIZE} users per page
+      </span>
+
+      ${
+        hasNextPage
+          ? `<a href="${escapeAttribute(nextUrl)}">Next →</a>`
+          : `<span class="disabled">Next →</span>`
+      }
+    </nav>
   </main>
 
   <script>
@@ -1110,7 +1204,6 @@ async function start() {
         }
 
         stopRequested = true;
-
         await setState("backfill_status", "stop_requested");
 
         return json(res, 200, {
@@ -1163,8 +1256,6 @@ async function start() {
           endFid,
           batchSize,
           delayMs,
-          statusUrl: "/backfill/status?token=YOUR_BACKFILL_TOKEN",
-          stopUrl: "/backfill/stop?token=YOUR_BACKFILL_TOKEN",
         });
       }
 
@@ -1181,26 +1272,42 @@ async function start() {
 
         if (fids.length === 0) {
           return json(res, 400, {
-            error: "Use /import?fids=13889&token=YOUR_BACKFILL_TOKEN",
+            error: "Use /import?fids=99&token=YOUR_BACKFILL_TOKEN",
           });
         }
 
-        const users = await fetchUsersFromNeynar(fids.map(Number));
+        const validFids = fids
+          .map(Number)
+          .filter((fid) => Number.isInteger(fid) && fid > 0);
+
+        if (validFids.length === 0) {
+          return json(res, 400, {
+            error: "FIDs must be positive whole numbers.",
+          });
+        }
+
+        const users = await fetchUsersFromNeynar(validFids);
 
         await saveUsers(users);
 
         return json(res, 200, {
           ok: true,
-          requested: fids.length,
+          requested: validFids.length,
           imported: users.length,
         });
       }
 
       if (url.pathname === "/" || url.pathname === "/favicon.ico") {
         const search = url.searchParams.get("search") || "";
+        const pageNumber = parseInteger(
+          url.searchParams.get("page"),
+          1,
+          1,
+          1000000
+        );
 
-        const [users, totals] = await Promise.all([
-          getUsers(search),
+        const [directory, totals] = await Promise.all([
+          getUsers(search, pageNumber),
           getDirectoryTotals(),
         ]);
 
@@ -1209,7 +1316,16 @@ async function start() {
           "Cache-Control": "no-store",
         });
 
-        res.end(page(users, totals, search));
+        res.end(
+          page(
+            directory.users,
+            totals,
+            search,
+            pageNumber,
+            directory.hasNextPage
+          )
+        );
+
         return;
       }
 
