@@ -50,9 +50,24 @@ function formatNumber(value) {
   return new Intl.NumberFormat("en-US").format(Number(value || 0));
 }
 
+function formatDate(value) {
+  if (!value) return "Unknown";
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) return "Unknown";
+
+  return new Intl.DateTimeFormat("en-GB", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(date);
+}
+
 function parseInteger(value, fallback, min, max) {
   const number = Number(value);
+
   if (!Number.isInteger(number)) return fallback;
+
   return Math.min(Math.max(number, min), max);
 }
 
@@ -76,6 +91,26 @@ function json(res, statusCode, body) {
   });
 
   res.end(JSON.stringify(body, null, 2));
+}
+
+function walletTypeLabel(walletType) {
+  const labels = {
+    custody: "Custody wallet",
+    verified_evm: "Verified EVM wallet",
+    verified_solana: "Verified Solana wallet",
+  };
+
+  return labels[walletType] || String(walletType || "Unknown wallet");
+}
+
+function walletTypeClass(walletType) {
+  const classes = {
+    custody: "custody",
+    verified_evm: "evm",
+    verified_solana: "solana",
+  };
+
+  return classes[walletType] || "unknown";
 }
 
 async function ensureSchema() {
@@ -181,6 +216,7 @@ async function fetchUsersFromNeynar(fids) {
   }
 
   const body = JSON.parse(text);
+
   return Array.isArray(body.users) ? body.users : [];
 }
 
@@ -303,6 +339,7 @@ async function importFidBatch(startFid, batchSize) {
   );
 
   const users = await fetchUsersFromNeynar(fids);
+
   await saveUsers(users);
 
   return {
@@ -365,6 +402,7 @@ async function runBackfill(endFid, batchSize, delayMs) {
           error instanceof Error ? error.message : String(error);
 
         console.error(`[backfill] error at FID ${nextFid}: ${message}`);
+
         await setState("backfill_last_error", message);
         await setState("backfill_status", "paused_after_error");
 
@@ -380,7 +418,9 @@ async function runBackfill(endFid, batchSize, delayMs) {
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+
     console.error("[backfill] fatal error:", message);
+
     await setState("backfill_last_error", message);
     await setState("backfill_status", "failed");
   } finally {
@@ -419,12 +459,15 @@ async function getUsers(search) {
         u.pfp_url,
         u.follower_count,
         u.following_count,
+        u.updated_at,
         COALESCE(
           json_agg(
             json_build_object(
               'address', w.address,
               'chain', w.chain,
-              'wallet_type', w.wallet_type
+              'wallet_type', w.wallet_type,
+              'source', w.source,
+              'updated_at', w.updated_at
             )
             ORDER BY w.wallet_type, w.address
           ) FILTER (WHERE w.address IS NOT NULL),
@@ -454,59 +497,141 @@ async function getDirectoryTotals() {
 }
 
 function page(users, totals, search) {
-  const rows = users.map((user, index) => {
-    const profileName = user.display_name || user.username || "Unknown";
-    const handle = user.username ? `@${user.username}` : "@unknown";
+  const rows = users
+    .map((user, index) => {
+      const profileName = user.display_name || user.username || "Unknown";
+      const profileUrl = user.username
+        ? `https://warpcast.com/${encodeURIComponent(user.username)}`
+        : null;
 
-    const avatar = user.pfp_url
-      ? `<img src="${escapeAttribute(user.pfp_url)}" alt="">`
-      : `<span>${escapeHtml(profileName.slice(0, 1).toUpperCase())}</span>`;
+      const avatar = user.pfp_url
+        ? `<img src="${escapeAttribute(user.pfp_url)}" alt="">`
+        : `<span>${escapeHtml(profileName.slice(0, 1).toUpperCase())}</span>`;
 
-    const wallets = user.wallets.length
-      ? user.wallets.map((wallet) => `
-          <div class="wallet">
-            <div>
-              <code title="${escapeAttribute(wallet.address)}">${escapeHtml(shortAddress(wallet.address))}</code>
-              <small>${escapeHtml(wallet.wallet_type.replaceAll("_", " "))} · ${escapeHtml(wallet.chain)}</small>
-            </div>
-            <div class="wallet-links">
-              <button onclick="copyWallet('${escapeAttribute(wallet.address)}')">Copy</button>
-              <a href="https://intel.arkm.com/explorer/address/${encodeURIComponent(wallet.address)}" target="_blank" rel="noreferrer">Arkham ↗</a>
-            </div>
-          </div>
-        `).join("")
-      : `<p class="empty-wallets">No connected wallets were returned for this user.</p>`;
-
-    const profileLink = user.username
-      ? `<a href="https://warpcast.com/${encodeURIComponent(user.username)}" target="_blank" rel="noreferrer">Farcaster profile ↗</a>`
-      : "";
-
-    return `
-      <article class="user-card">
-        <button class="user-row" onclick="toggleUser('user-${user.fid}')">
-          <span class="rank">#${index + 1}</span>
-          <span class="profile">
+      const profileHtml = profileUrl
+        ? `
+          <a
+            class="profile-link"
+            href="${profileUrl}"
+            target="_blank"
+            rel="noreferrer"
+            onclick="event.stopPropagation()"
+          >
             <span class="avatar">${avatar}</span>
             <span>
               <strong>${escapeHtml(profileName)}</strong>
-              <em>${escapeHtml(handle)}</em>
+              <span class="handle">@${escapeHtml(user.username)}</span>
+            </span>
+          </a>
+        `
+        : `
+          <span class="profile-link">
+            <span class="avatar">${avatar}</span>
+            <span>
+              <strong>${escapeHtml(profileName)}</strong>
+              <span class="handle">@unknown</span>
             </span>
           </span>
-          <span class="fid">FID #${user.fid}</span>
-          <span class="followers">${formatNumber(user.follower_count)} <small>followers</small></span>
-          <span class="wallet-count">${user.wallets.length} <small>wallets</small></span>
-        </button>
+        `;
 
-        <section id="user-${user.fid}" class="wallet-panel">
-          <div class="wallet-panel-title">
-            <span>Connected wallets</span>
-            ${profileLink}
-          </div>
-          ${wallets}
-        </section>
-      </article>
-    `;
-  }).join("");
+      const wallets = user.wallets.length
+        ? user.wallets
+            .map((wallet) => {
+              const arkmUrl = `https://intel.arkm.com/explorer/address/${encodeURIComponent(
+                wallet.address
+              )}`;
+
+              return `
+                <div class="wallet">
+                  <div class="wallet-main">
+                    <code title="${escapeAttribute(wallet.address)}">${escapeHtml(
+                      shortAddress(wallet.address)
+                    )}</code>
+                    <div class="wallet-details">
+                      <span class="wallet-badge ${walletTypeClass(
+                        wallet.wallet_type
+                      )}">${escapeHtml(
+                walletTypeLabel(wallet.wallet_type)
+              )}</span>
+                      <span class="wallet-chain">${escapeHtml(
+                        wallet.chain
+                      )}</span>
+                    </div>
+                    <small>Source: ${escapeHtml(
+                      wallet.source || "neynar"
+                    )} · synced ${escapeHtml(formatDate(wallet.updated_at))}</small>
+                  </div>
+
+                  <div class="wallet-links">
+                    <button
+                      type="button"
+                      onclick="copyWallet('${escapeAttribute(wallet.address)}')"
+                    >
+                      Copy
+                    </button>
+
+                    <a
+                      href="${arkmUrl}"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Arkham ↗
+                    </a>
+                  </div>
+                </div>
+              `;
+            })
+            .join("")
+        : `<p class="empty-wallets">No connected wallets were returned for this Farcaster user.</p>`;
+
+      const profileLink = profileUrl
+        ? `<a href="${profileUrl}" target="_blank" rel="noreferrer">Open Farcaster profile ↗</a>`
+        : "";
+
+      return `
+        <article class="user-card">
+          <button
+            type="button"
+            class="user-row"
+            onclick="toggleUser('user-${user.fid}')"
+          >
+            <span class="rank">#${index + 1}</span>
+
+            <span class="profile">
+              ${profileHtml}
+            </span>
+
+            <span class="fid">FID #${user.fid}</span>
+
+            <span class="followers">
+              ${formatNumber(user.follower_count)}
+              <small>Neynar follower snapshot</small>
+            </span>
+
+            <span class="wallet-count">
+              ${user.wallets.length}
+              <small>wallets</small>
+            </span>
+          </button>
+
+          <section id="user-${user.fid}" class="wallet-panel">
+            <div class="wallet-panel-title">
+              <div>
+                <span>Farcaster-linked wallets</span>
+                <small>Profile last synced: ${escapeHtml(
+                  formatDate(user.updated_at)
+                )}</small>
+              </div>
+
+              ${profileLink}
+            </div>
+
+            ${wallets}
+          </section>
+        </article>
+      `;
+    })
+    .join("");
 
   return `<!doctype html>
 <html>
@@ -514,75 +639,421 @@ function page(users, totals, search) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Farcaster Wallet Tracker</title>
+
   <style>
-    *{box-sizing:border-box}
-    body{margin:0;background:#090b10;color:#f4f4f5;font-family:Arial,sans-serif}
-    .wrap{max-width:1220px;margin:auto;padding:30px 16px 60px}
-    .eyebrow{color:#22d3ee;font-size:11px;font-weight:800;letter-spacing:2px}
-    h1{margin:8px 0;font-size:30px}
-    .description{color:#a1a1aa;margin:0 0 22px}
-    form{display:flex;gap:8px;margin-bottom:20px}
-    input{flex:1;min-width:0;padding:13px;border:1px solid #3f3f46;border-radius:8px;background:#18181b;color:#fff;font-size:15px}
-    form button{border:0;border-radius:8px;background:#22d3ee;color:#071014;padding:0 16px;font-weight:800;cursor:pointer}
-    .meta{display:flex;justify-content:space-between;color:#a1a1aa;font-size:13px;margin:12px 0}
-    .meta b{color:#fff}
-    .directory{border:1px solid #27272a;border-radius:12px;overflow:hidden;background:#10131a}
-    .user-card{border-bottom:1px solid #27272a}
-    .user-card:last-child{border:0}
-    .user-row{width:100%;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer;display:grid;grid-template-columns:60px minmax(220px,2fr) 120px 150px 100px;gap:12px;align-items:center;padding:15px}
-    .user-row:hover{background:#171b24}
-    .rank{color:#71717a}
-    .profile{display:flex;align-items:center;gap:12px;min-width:0}
-    .avatar{width:40px;height:40px;flex:none;border-radius:50%;overflow:hidden;background:#27272a;display:grid;place-items:center}
-    .avatar img{width:100%;height:100%;object-fit:cover}
-    strong,em{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    strong{font-size:15px}
-    em{font-size:13px;font-style:normal;color:#22d3ee;margin-top:3px}
-    .fid,.followers,.wallet-count{font-size:14px}
-    .followers{font-weight:700}
-    .followers small,.wallet-count small{display:block;color:#71717a;font-size:11px;font-weight:400;margin-top:3px}
-    .wallet-panel{display:none;border-top:1px solid #27272a;background:#0b0e14;padding:15px}
-    .wallet-panel.open{display:block}
-    .wallet-panel-title{display:flex;justify-content:space-between;color:#a1a1aa;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
-    .wallet-panel-title a{color:#22d3ee;text-decoration:none;text-transform:none;letter-spacing:0}
-    .wallet{display:flex;justify-content:space-between;gap:15px;align-items:center;border:1px solid #27272a;border-radius:8px;background:#090b10;padding:11px 12px;margin-top:8px}
-    .wallet code{color:#e4e4e7;font-size:13px}
-    .wallet small{display:block;color:#71717a;margin-top:5px;text-transform:capitalize}
-    .wallet-links{display:flex;gap:8px}
-    .wallet-links button,.wallet-links a{border:1px solid #3f3f46;background:transparent;color:#d4d4d8;padding:6px 8px;border-radius:6px;text-decoration:none;font-size:12px;cursor:pointer}
-    .wallet-links button:hover,.wallet-links a:hover{border-color:#22d3ee;color:#22d3ee}
-    .empty-wallets{color:#71717a;font-size:13px}
-    .empty{padding:50px;text-align:center;color:#a1a1aa}
-    @media(max-width:700px){
-      .user-row{grid-template-columns:40px 1fr 72px;gap:8px;padding:13px}
-      .fid,.wallet-count{display:none}
-      .followers small{display:none}
-      .wallet{align-items:flex-start;flex-direction:column}
-      .wallet-links{width:100%}
-      .wallet-links>*{flex:1;text-align:center}
-      .meta{gap:10px}
-      .user-row .followers{justify-self:end}
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: #090b10;
+      color: #f4f4f5;
+      font-family: Arial, sans-serif;
+    }
+
+    .wrap {
+      max-width: 1220px;
+      margin: auto;
+      padding: 30px 16px 60px;
+    }
+
+    .eyebrow {
+      color: #22d3ee;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 2px;
+    }
+
+    h1 {
+      margin: 8px 0;
+      font-size: 30px;
+    }
+
+    .description {
+      color: #a1a1aa;
+      margin: 0 0 22px;
+    }
+
+    form {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 20px;
+    }
+
+    input {
+      flex: 1;
+      min-width: 0;
+      padding: 13px;
+      border: 1px solid #3f3f46;
+      border-radius: 8px;
+      background: #18181b;
+      color: #fff;
+      font-size: 15px;
+    }
+
+    form button {
+      border: 0;
+      border-radius: 8px;
+      background: #22d3ee;
+      color: #071014;
+      padding: 0 16px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    .meta {
+      display: flex;
+      justify-content: space-between;
+      color: #a1a1aa;
+      font-size: 13px;
+      margin: 12px 0;
+    }
+
+    .meta b {
+      color: #fff;
+    }
+
+    .directory {
+      border: 1px solid #27272a;
+      border-radius: 12px;
+      overflow: hidden;
+      background: #10131a;
+    }
+
+    .user-card {
+      border-bottom: 1px solid #27272a;
+    }
+
+    .user-card:last-child {
+      border: 0;
+    }
+
+    .user-row {
+      width: 100%;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      text-align: left;
+      cursor: pointer;
+      display: grid;
+      grid-template-columns: 60px minmax(220px, 2fr) 120px 180px 100px;
+      gap: 12px;
+      align-items: center;
+      padding: 15px;
+    }
+
+    .user-row:hover {
+      background: #171b24;
+    }
+
+    .rank {
+      color: #71717a;
+    }
+
+    .profile {
+      min-width: 0;
+    }
+
+    .profile-link {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+      color: inherit;
+      text-decoration: none;
+    }
+
+    a.profile-link:hover strong,
+    a.profile-link:hover .handle {
+      color: #67e8f9;
+      text-decoration: underline;
+    }
+
+    .avatar {
+      width: 40px;
+      height: 40px;
+      flex: none;
+      border-radius: 50%;
+      overflow: hidden;
+      background: #27272a;
+      display: grid;
+      place-items: center;
+    }
+
+    .avatar img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    strong,
+    .handle {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    strong {
+      font-size: 15px;
+    }
+
+    .handle {
+      font-size: 13px;
+      color: #22d3ee;
+      margin-top: 3px;
+    }
+
+    .fid,
+    .followers,
+    .wallet-count {
+      font-size: 14px;
+    }
+
+    .followers {
+      font-weight: 700;
+    }
+
+    .followers small,
+    .wallet-count small {
+      display: block;
+      color: #71717a;
+      font-size: 11px;
+      font-weight: 400;
+      margin-top: 3px;
+    }
+
+    .wallet-panel {
+      display: none;
+      border-top: 1px solid #27272a;
+      background: #0b0e14;
+      padding: 15px;
+    }
+
+    .wallet-panel.open {
+      display: block;
+    }
+
+    .wallet-panel-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: #a1a1aa;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 10px;
+    }
+
+    .wallet-panel-title small {
+      display: block;
+      margin-top: 5px;
+      color: #71717a;
+      font-size: 11px;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+
+    .wallet-panel-title a {
+      color: #22d3ee;
+      text-decoration: none;
+      text-transform: none;
+      letter-spacing: 0;
+      white-space: nowrap;
+    }
+
+    .wallet-panel-title a:hover {
+      color: #67e8f9;
+      text-decoration: underline;
+    }
+
+    .wallet {
+      display: flex;
+      justify-content: space-between;
+      gap: 15px;
+      align-items: center;
+      border: 1px solid #27272a;
+      border-radius: 8px;
+      background: #090b10;
+      padding: 11px 12px;
+      margin-top: 8px;
+    }
+
+    .wallet-main {
+      min-width: 0;
+    }
+
+    .wallet code {
+      color: #e4e4e7;
+      font-size: 13px;
+    }
+
+    .wallet-details {
+      display: flex;
+      gap: 7px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 7px;
+    }
+
+    .wallet-badge,
+    .wallet-chain {
+      border-radius: 999px;
+      padding: 3px 7px;
+      font-size: 10px;
+      font-weight: 700;
+    }
+
+    .wallet-badge.custody {
+      background: #27354f;
+      color: #93c5fd;
+    }
+
+    .wallet-badge.evm {
+      background: #16362d;
+      color: #86efac;
+    }
+
+    .wallet-badge.solana {
+      background: #34234b;
+      color: #d8b4fe;
+    }
+
+    .wallet-badge.unknown {
+      background: #3f3f46;
+      color: #d4d4d8;
+    }
+
+    .wallet-chain {
+      background: #27272a;
+      color: #a1a1aa;
+      text-transform: uppercase;
+    }
+
+    .wallet small {
+      display: block;
+      color: #71717a;
+      margin-top: 7px;
+      font-size: 11px;
+    }
+
+    .wallet-links {
+      display: flex;
+      gap: 8px;
+      flex: none;
+    }
+
+    .wallet-links button,
+    .wallet-links a {
+      border: 1px solid #3f3f46;
+      background: transparent;
+      color: #d4d4d8;
+      padding: 6px 8px;
+      border-radius: 6px;
+      text-decoration: none;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .wallet-links button:hover,
+    .wallet-links a:hover {
+      border-color: #22d3ee;
+      color: #22d3ee;
+    }
+
+    .empty-wallets {
+      color: #71717a;
+      font-size: 13px;
+    }
+
+    .empty {
+      padding: 50px;
+      text-align: center;
+      color: #a1a1aa;
+    }
+
+    @media (max-width: 700px) {
+      .user-row {
+        grid-template-columns: 40px 1fr 82px;
+        gap: 8px;
+        padding: 13px;
+      }
+
+      .fid,
+      .wallet-count {
+        display: none;
+      }
+
+      .followers small {
+        display: none;
+      }
+
+      .wallet {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .wallet-links {
+        width: 100%;
+      }
+
+      .wallet-links > * {
+        flex: 1;
+        text-align: center;
+      }
+
+      .meta {
+        gap: 10px;
+      }
+
+      .user-row .followers {
+        justify-self: end;
+      }
+
+      .wallet-panel-title {
+        align-items: flex-start;
+        flex-direction: column;
+      }
     }
   </style>
 </head>
+
 <body>
   <main class="wrap">
     <div class="eyebrow">FARCASTER INTELLIGENCE</div>
+
     <h1>Connected Wallet Directory</h1>
-    <p class="description">Farcaster FIDs and their custody / verified wallet addresses. Sorted by followers.</p>
+
+    <p class="description">
+      Farcaster custody and verified wallet addresses from Neynar.
+      Users are sorted by the stored Neynar follower snapshot.
+    </p>
 
     <form>
-      <input name="search" value="${escapeAttribute(search)}" placeholder="Search @username, FID, or wallet address">
+      <input
+        name="search"
+        value="${escapeAttribute(search)}"
+        placeholder="Search @username, FID, or wallet address"
+      >
       <button type="submit">Search</button>
     </form>
 
     <div class="meta">
-      <span><b>${formatNumber(totals.user_count)}</b> imported Farcaster users · <b>${formatNumber(totals.wallet_count)}</b> connected wallets</span>
-      <span>Sort: Followers ↓</span>
+      <span>
+        <b>${formatNumber(totals.user_count)}</b> imported Farcaster users ·
+        <b>${formatNumber(totals.wallet_count)}</b> Farcaster-linked wallets
+      </span>
+
+      <span>Sort: Neynar followers ↓</span>
     </div>
 
     <section class="directory">
-      ${users.length ? rows : `<div class="empty">No users match your search yet.</div>`}
+      ${
+        users.length
+          ? rows
+          : `<div class="empty">No users match your search yet.</div>`
+      }
     </section>
   </main>
 
@@ -592,8 +1063,12 @@ function page(users, totals, search) {
     }
 
     async function copyWallet(address) {
-      await navigator.clipboard.writeText(address);
-      alert("Wallet copied");
+      try {
+        await navigator.clipboard.writeText(address);
+        alert("Wallet copied");
+      } catch {
+        alert("Could not copy wallet automatically: " + address);
+      }
     }
   </script>
 </body>
@@ -635,6 +1110,7 @@ async function start() {
         }
 
         stopRequested = true;
+
         await setState("backfill_status", "stop_requested");
 
         return json(res, 200, {
@@ -710,6 +1186,7 @@ async function start() {
         }
 
         const users = await fetchUsersFromNeynar(fids.map(Number));
+
         await saveUsers(users);
 
         return json(res, 200, {
@@ -721,6 +1198,7 @@ async function start() {
 
       if (url.pathname === "/" || url.pathname === "/favicon.ico") {
         const search = url.searchParams.get("search") || "";
+
         const [users, totals] = await Promise.all([
           getUsers(search),
           getDirectoryTotals(),
@@ -735,7 +1213,10 @@ async function start() {
         return;
       }
 
-      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.writeHead(404, {
+        "Content-Type": "text/plain; charset=utf-8",
+      });
+
       res.end("Not found");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -746,7 +1227,12 @@ async function start() {
         "Content-Type": "application/json; charset=utf-8",
       });
 
-      res.end(JSON.stringify({ error: "Server error.", details: message }));
+      res.end(
+        JSON.stringify({
+          error: "Server error.",
+          details: message,
+        })
+      );
     }
   });
 
