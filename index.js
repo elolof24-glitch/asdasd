@@ -160,9 +160,6 @@ async function ensureSchema() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    CREATE INDEX IF NOT EXISTS farcaster_users_followers_idx
-      ON farcaster_users (follower_count DESC NULLS LAST);
-
     CREATE INDEX IF NOT EXISTS farcaster_users_username_idx
       ON farcaster_users (username);
 
@@ -224,7 +221,6 @@ async function fetchUsersFromNeynar(fids) {
   const response = await fetch(url, {
     headers: {
       "x-api-key": neynarApiKey,
-      "x-neynar-experimental": "true",
       accept: "application/json",
     },
   });
@@ -291,27 +287,39 @@ async function saveUsers(users) {
       const uniqueWallets = new Map();
 
       if (user.custody_address) {
-        uniqueWallets.set(normalizeAddress(user.custody_address), {
-          address: normalizeAddress(user.custody_address),
-          chain: "ethereum",
-          walletType: "custody",
-        });
+        const address = normalizeAddress(user.custody_address);
+
+        if (address) {
+          uniqueWallets.set(address, {
+            address,
+            chain: "ethereum",
+            walletType: "custody",
+          });
+        }
       }
 
-      for (const address of user.verified_addresses?.eth_addresses || []) {
-        uniqueWallets.set(normalizeAddress(address), {
-          address: normalizeAddress(address),
-          chain: "ethereum",
-          walletType: "verified_evm",
-        });
+      for (const addressValue of user.verified_addresses?.eth_addresses || []) {
+        const address = normalizeAddress(addressValue);
+
+        if (address) {
+          uniqueWallets.set(address, {
+            address,
+            chain: "ethereum",
+            walletType: "verified_evm",
+          });
+        }
       }
 
-      for (const address of user.verified_addresses?.sol_addresses || []) {
-        uniqueWallets.set(normalizeAddress(address), {
-          address: normalizeAddress(address),
-          chain: "solana",
-          walletType: "verified_solana",
-        });
+      for (const addressValue of user.verified_addresses?.sol_addresses || []) {
+        const address = normalizeAddress(addressValue);
+
+        if (address) {
+          uniqueWallets.set(address, {
+            address,
+            chain: "solana",
+            walletType: "verified_solana",
+          });
+        }
       }
 
       for (const wallet of uniqueWallets.values()) {
@@ -481,8 +489,6 @@ async function getUsers(search, pageNumber) {
         u.username,
         u.display_name,
         u.pfp_url,
-        u.follower_count,
-        u.following_count,
         u.updated_at,
         COALESCE(
           json_agg(
@@ -501,7 +507,7 @@ async function getUsers(search, pageNumber) {
       LEFT JOIN wallets w ON w.fid = u.fid
       ${where}
       GROUP BY u.fid
-      ORDER BY u.follower_count DESC NULLS LAST, u.fid ASC
+      ORDER BY u.fid ASC
       LIMIT $${values.length - 1}
       OFFSET $${values.length}
     `,
@@ -528,14 +534,14 @@ async function getDirectoryTotals() {
 }
 
 function page(users, totals, search, pageNumber, hasNextPage) {
-  const startRank = (pageNumber - 1) * PAGE_SIZE;
+  const startIndex = (pageNumber - 1) * PAGE_SIZE;
 
   const rows = users
     .map((user, index) => {
       const profileName = user.display_name || user.username || "Unknown";
-
-      const profileUrl = user.username
-        ? `https://warpcast.com/${encodeURIComponent(user.username)}`
+      const username = user.username || "";
+      const profileUrl = username
+        ? `https://warpcast.com/${encodeURIComponent(username)}`
         : "";
 
       const avatar = user.pfp_url
@@ -554,7 +560,7 @@ function page(users, totals, search, pageNumber, hasNextPage) {
             <span class="avatar">${avatar}</span>
             <span class="profile-text">
               <strong>${escapeHtml(profileName)}</strong>
-              <span class="handle">@${escapeHtml(user.username)}</span>
+              <span class="handle">@${escapeHtml(username)}</span>
             </span>
           </a>
         `
@@ -609,6 +615,7 @@ function page(users, totals, search, pageNumber, hasNextPage) {
                     )}"
                     target="_blank"
                     rel="noreferrer"
+                    onclick="event.stopPropagation()"
                   >
                     Arkham ↗
                   </a>
@@ -625,15 +632,18 @@ function page(users, totals, search, pageNumber, hasNextPage) {
             class="user-row"
             onclick="toggleUser('user-${user.fid}')"
           >
-            <span class="rank">#${startRank + index + 1}</span>
+            <span class="rank">#${startIndex + index + 1}</span>
 
             <span class="profile">${profile}</span>
 
             <span class="fid">FID #${user.fid}</span>
 
-            <span class="followers">
-              ${formatNumber(user.follower_count)}
-              <small>filtered follower count</small>
+            <span class="follower-link">
+              ${
+                profileUrl
+                  ? `<a href="${profileUrl}" target="_blank" rel="noreferrer" onclick="event.stopPropagation()">Open Farcaster profile ↗</a>`
+                  : `<span>Profile unavailable</span>`
+              }
             </span>
 
             <span class="wallet-count">
@@ -773,7 +783,7 @@ function page(users, totals, search, pageNumber, hasNextPage) {
       text-align: left;
       cursor: pointer;
       display: grid;
-      grid-template-columns: 60px minmax(220px, 2fr) 120px 180px 100px;
+      grid-template-columns: 60px minmax(220px, 2fr) 120px 200px 100px;
       gap: 12px;
       align-items: center;
       padding: 15px;
@@ -846,16 +856,31 @@ function page(users, totals, search, pageNumber, hasNextPage) {
     }
 
     .fid,
-    .followers,
+    .follower-link,
     .wallet-count {
       font-size: 14px;
     }
 
-    .followers {
+    .follower-link a {
+      color: #22d3ee;
+      text-decoration: none;
+      font-size: 12px;
+    }
+
+    .follower-link a:hover {
+      color: #67e8f9;
+      text-decoration: underline;
+    }
+
+    .follower-link span {
+      color: #71717a;
+      font-size: 12px;
+    }
+
+    .wallet-count {
       font-weight: 700;
     }
 
-    .followers small,
     .wallet-count small {
       display: block;
       color: #71717a;
@@ -1028,7 +1053,6 @@ function page(users, totals, search, pageNumber, hasNextPage) {
     .pagination .disabled {
       color: #52525b;
       border-color: #27272a;
-      cursor: not-allowed;
     }
 
     .pagination .page-status {
@@ -1050,17 +1074,14 @@ function page(users, totals, search, pageNumber, hasNextPage) {
 
     @media (max-width: 700px) {
       .user-row {
-        grid-template-columns: 40px 1fr 82px;
+        grid-template-columns: 40px 1fr 72px;
         gap: 8px;
         padding: 13px;
       }
 
       .fid,
+      .follower-link,
       .wallet-count {
-        display: none;
-      }
-
-      .followers small {
         display: none;
       }
 
@@ -1083,13 +1104,19 @@ function page(users, totals, search, pageNumber, hasNextPage) {
         gap: 4px;
       }
 
-      .user-row .followers {
-        justify-self: end;
-      }
-
       .wallet-panel-title {
         align-items: flex-start;
         flex-direction: column;
+      }
+
+      .pagination {
+        flex-wrap: wrap;
+      }
+
+      .pagination .page-status {
+        order: 3;
+        width: 100%;
+        text-align: center;
       }
     }
   </style>
@@ -1102,8 +1129,8 @@ function page(users, totals, search, pageNumber, hasNextPage) {
     <h1>Connected Wallet Directory</h1>
 
     <p class="description">
-      Farcaster custody and verified wallet addresses from Neynar.
-      Users are sorted by filtered follower count.
+      Browse Farcaster custody and verified wallet addresses.
+      Open a Farcaster profile to view its current follower count.
     </p>
 
     <form>
@@ -1121,7 +1148,7 @@ function page(users, totals, search, pageNumber, hasNextPage) {
         <b>${formatNumber(totals.wallet_count)}</b> Farcaster-linked wallets
       </span>
 
-      <span>Sort: filtered followers ↓</span>
+      <span>Sort: FID ↑</span>
     </div>
 
     <section class="directory">
